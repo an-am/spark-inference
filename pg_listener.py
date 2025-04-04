@@ -1,7 +1,8 @@
 # pg_listener.py
 import select
 import psycopg2
-import socket
+from kafka import KafkaProducer
+import json
 
 # PostgreSQL connection parameters (adjust as needed)
 db_config = {
@@ -18,17 +19,16 @@ cursor = conn.cursor()
 HOST = 'localhost'
 PORT = 9999  # choose an available port
 
-server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server_socket.bind((HOST, PORT))
-server_socket.listen(1)
-print(f"Socket server listening on {HOST}:{PORT}")
-
-client_socket, addr = server_socket.accept()
-print(f"Accepted connection from {addr}")
 
 # Listen to the channel table_insert
 cursor.execute("LISTEN table_insert;")
 print("Listener is active and waiting for events...")
+
+# Set up Kafka producer
+producer = KafkaProducer(
+    bootstrap_servers='localhost:9092',
+    value_serializer=lambda v: v.encode('utf-8')
+)
 
 try:
     while True:
@@ -41,13 +41,13 @@ try:
                 notify = conn.notifies.pop(0)
                 # Assume notify.payload is a JSON string with row_id and client_id
                 payload = notify.payload
-                # print("Received notification:", payload)
-                # Send the payload over the socket, ending with a newline
-                client_socket.sendall((payload + "\n").encode("utf-8"))
+                print("Received notification:", payload)
+                # Send only the payload to Kafka
+                producer.send("notifications", value=payload)
+                producer.flush()
+
 except KeyboardInterrupt:
     print("Listener interrupted, shutting down.")
 finally:
-    client_socket.close()
-    server_socket.close()
     cursor.close()
     conn.close()
