@@ -1,9 +1,10 @@
-from typing import Iterator
+import warnings
+warnings.filterwarnings("ignore")
 
+from typing import Iterator
 import joblib
 import pandas as pd
 import pyspark.sql.dataframe
-import pyspark.pandas as ps
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import *
 from pyspark.sql.streaming.state import GroupState
@@ -24,8 +25,8 @@ db_config = {
     "port": "5432"
 }
 
-scaler_path = 'deep_scaler.pkl'
-model_path = 'deep_model.h5'
+scaler_path = '/Users/antonelloamore/PycharmProjects/spark-inference/deep_scaler.pkl'
+model_path = '/Users/antonelloamore/PycharmProjects/spark-inference/deep_model.h5'
 
 fitted_lambda_wealth, fitted_lambda_income = [0.1336735055366279, 0.3026418664067109]
 
@@ -33,6 +34,12 @@ column_names = [
     "Id", "Age", "Gender", "FamilyMembers", "FinancialEducation",
     "RiskPropensity", "Income", "Wealth", "IncomeInvestment",
     "AccumulationInvestment", "FinancialStatus", "ClientId"
+]
+
+feature_names = [
+    "Age", "Gender", "FamilyMembers",
+    "FinancialEducation", "Income", "Wealth",
+    "IncomeInvestment", "AccumulationInvestment", "FinancialStatus"
 ]
 
 payload_schema = StructType([
@@ -55,15 +62,9 @@ schema = StructType(
      StructField('ClientId', FloatType(), False)])
 
 prediction_schema = StructType(
-    [StructField('Age', IntegerType(), True),
-     StructField('Gender', IntegerType(), True),
-     StructField('FamilyMembers', IntegerType(), True),
-     StructField('FinancialEducation', FloatType(), True),
-     StructField('Income', FloatType(), True),
-     StructField('Wealth', FloatType(), True),
-     StructField('IncomeInvestment', IntegerType(), True),
-     StructField('AccumulationInvestment', IntegerType(), True),
-     StructField('FinancialStatus', FloatType(), True),])
+    [StructField('Id', IntegerType(), False),
+     StructField('RiskPropensity', FloatType(), False)])
+
 
 _model = None
 def load_model():
@@ -96,18 +97,23 @@ def data_prep(data: DataFrame) -> DataFrame:
         .withColumn("FinancialStatus", col("FinancialEducation") * log(col("Wealth"))) \
         .withColumn("Wealth", (pow(col("Wealth"), fitted_lambda_wealth) - 1) / fitted_lambda_wealth) \
         .withColumn("Income", (pow(col("Income"), fitted_lambda_income) - 1) / fitted_lambda_income) \
-        .drop("RiskPropensity", "ClientId")
+        .drop("ClientId")
+
 
 '''
-@pandas_udf(FloatType())
-def predict_udf(iterator: Iterator[Tuple[pd.Series, pd.Series, pd.Series,
+@pandas_udf(FloatType(), PandasUDFType.SCALAR_ITER)
+def predict_udf(iterator: Iterator[
+    Tuple[pd.Series, pd.Series, pd.Series,
     pd.Series, pd.Series, pd.Series,
-    pd.Series, pd.Series, pd.Series]]) -> Iterator[pd.Series]:
-    for row in iterator:
-        # Each row is a tuple of 9 pandas Series corresponding to the input columns.
-        age, gender, family_members, fin_ed, income, wealth, inc_inv, acc_inv, fin_status = row
-        print(row)
+    pd.Series, pd.Series, pd.Series]]
+                ) -> Iterator[pd.Series]:
+    for age, gender, family_members, fin_ed, income, wealth, inc_inv, acc_inv, fin_status in iterator:
+        pd_data = pd.concat([age, gender, family_members, fin_ed, income, wealth, inc_inv, acc_inv, fin_status],
+                            axis=1).to_numpy()
 
+        scaler = load_scaler()
+        pd_data_scaled = scaler.transform(pd_data)
+        ##############
         # Assemble the inputs into a small DataFrame chunk
         data = pd.DataFrame({
             'Age': age,
@@ -120,53 +126,33 @@ def predict_udf(iterator: Iterator[Tuple[pd.Series, pd.Series, pd.Series,
             'AccumulationInvestment': acc_inv,
             'FinancialStatus': fin_status
         })
+
         scaler = load_scaler()
-        #data_scaled = scaler.transform(data)
+        data_scaled = scaler.transform(data)
+        ##############
         model = load_model()
-        #predictions = model.predict(data_scaled, verbose=0).flatten()
-        yield pd.Series([0.0] * len(age))
+
+        predictions = model.predict(pd_data_scaled, verbose=0).flatten()
+        yield pd.Series(list(predictions))
 '''
-@pandas_udf(FloatType())
-def predict_udf(
-        age: pd.Series,
-        gender: pd.Series,
-        family_members: pd.Series,
-        financial_education: pd.Series,
-        income: pd.Series,
-        wealth: pd.Series,
-        income_investment: pd.Series,
-        accumulation_investment: pd.Series,
-        financial_status: pd.Series) -> pd.Series:
 
-    # Combine the features into a DataFrame
-    
-    data = pd.DataFrame({
-        'Age': age,
-        'Gender': gender,
-        'FamilyMembers': family_members,
-        'FinancialEducation': financial_education,
-        'Income': income,
-        'Wealth': wealth,
-        'IncomeInvestment': income_investment,
-        'AccumulationInvestment': accumulation_investment,
-        'FinancialStatus': financial_status
-    })
-    print(data.shape)
-
-    scaler = load_scaler()
-    df_scaled = scaler.transform(data)
-
+def predict_partition(rows):
+    # global model reuse pattern
     model = load_model()
-    predictions = model.predict(df_scaled, verbose=0).flatten()
+    scaler = load_scaler()
+    for row in rows:
+        row_id = row["Id"]
+        features = np.array([[row[f] for f in feature_names]], dtype=float)
+        features_scaled = scaler.transform(features)
+        pred = float(model.predict(features_scaled.reshape(1, -1), verbose=0)[0][0])
+        # append prediction to row (could yield a dict or a new Row)
+        yield (row_id, pred)
 
-    print(f"predictions: {predictions}")
-
-    return pd.Series(predictions)
-
-
-def query_db(row: Row):
+def query_db(row):
     # Open a connection to PostgreSQL for this microbatch
     cursor = load_cursor()
+
+    print(f"row: {row}")
 
     # Update DB: financial_Status and risk_propensity
     query = f"""UPDATE needs 
@@ -195,65 +181,57 @@ def query_db(row: Row):
 
 
 def process_batch(df: pyspark.sql.dataframe.DataFrame, epoch_id):
-
     # Data prep
     df = df.transform(data_prep)
 
     # Prediction + queries
-    df.select(
-        "*",
-        predict_udf(
-            col("Age"),
-            col("Gender"),
-            col("FamilyMembers"),
-            col("FinancialEducation"),
-            col("Income"),
-            col("Wealth"),
-            col("IncomeInvestment"),
-            col("AccumulationInvestment"),
-            col("FinancialStatus")
-        ).alias("RiskPropensity")
-    ).foreach(query_db)
+    result_rdd = df.drop('RiskPropensity').rdd.mapPartitions(predict_partition)
+
+    result_df = spark.createDataFrame(result_rdd, schema=prediction_schema) \
+        .join(df, on=['Id'], how='outer')
+
+    result_df.rdd.foreach(query_db)
 
 
-def update_request_count(client_id, pdf: Iterable[DataFrame], state: GroupState):
+def update_request_count(client_id, pdf: Iterator[pd.DataFrame], state: GroupState) -> Iterator[pd.DataFrame]:
     # Log the client_id for debugging purposes
-    print(f"Processing client_id: {client_id}")
+    #print(f"Processing client_id: {client_id}")
 
     # Initialize state if not available; state holds the running count for this client
     current_count = state.get[0] if state.exists else 0
-    allowed_rows = []
 
-    #pdf = pd.concat(list(pdf))
+    for client in pdf:
+        for row in client.itertuples(index=False):
+            id = row[0]
+            client_id = row[1]
 
-    for row in pdf:
+            #print(f"Processing client {client_id}, current_count: {current_count}")
 
-        if current_count < NUM_MAX_REQUESTS:
-            allowed_rows.append(row)
-            current_count += 1
+            if current_count < NUM_MAX_REQUESTS:
+                current_count += 1
 
-            # Update state with the new count (you can also add client_id here if desired)
-            new_state = (current_count,)
-            state.update(new_state)
+                # Update state with the new count (you can also add client_id here if desired)
+                new_state = (current_count,)
+                state.update(new_state)
 
-            # Connect to Postgres
-            cursor = load_cursor()
+                # Connect to Postgres
+                cursor = load_cursor()
 
-            query = f"""SELECT * 
-                        FROM needs 
-                        WHERE id = {row['id'].iloc[0]}"""
-            cursor.execute(query)
+                query = f"""SELECT * 
+                            FROM needs 
+                            WHERE id = {id}"""
+                cursor.execute(query)
 
-            result = cursor.fetchall()
+                result = cursor.fetchall()
 
-            df = pd.DataFrame(result, columns=column_names)
+                df = pd.DataFrame(result, columns=column_names)
 
-            yield df
+                yield df
 
-        else:
-            # Log that this client's quota is exceeded
-            print(f"Client {client_id} reached max requests: {current_count}")
-            yield pd.DataFrame(columns=column_names)
+            #else:
+                # Log that this client's quota is exceeded
+                #print(f"Client {client_id} reached max requests: {current_count}")
+                # yield pd.DataFrame(columns=column_names)
 
 
 if __name__ == "__main__":
@@ -265,9 +243,7 @@ if __name__ == "__main__":
     spark = SparkSession \
         .builder \
         .appName("SparkInference") \
-        .master("local[10]") \
-        .config("spark.driver.memory", "4g") \
-        .config("spark.executor.memory", "4g") \
+        .master("spark://master:7077") \
         .config("spark.jars.excludes", "org.slf4j:slf4j-api") \
         .getOrCreate()
 
@@ -297,8 +273,8 @@ if __name__ == "__main__":
             outputStructType=schema,
             stateStructType="count INT",
             outputMode="append",
-            timeoutConf="ProcessingTimeTimeout") \
-        .filter("Id is not null")
+            timeoutConf="NoTimeout")
+        #.filter("Id is not null")
 
     query = stateful_df \
         .writeStream \
